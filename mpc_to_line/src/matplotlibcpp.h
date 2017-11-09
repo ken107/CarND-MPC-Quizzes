@@ -3,21 +3,21 @@
 #include <vector>
 #include <map>
 #include <numeric>
+#include <algorithm>
 #include <stdexcept>
 #include <iostream>
+#include <stdint.h> // <cstdint> requires c++11 support
 
 #if __cplusplus > 199711L || _MSC_VER > 1800
 #include <functional>
 #endif
 
-// i.e. g++ -DMATPLOTLIBCPP_PYTHON_HEADER=/usr/include/python3.6/Python.h [...]
-#ifdef MATPLOTLIBCPP_PYTHON_HEADER
-#define STRINGIFY_(x) #x
-#define STRINGIFY(x) STRINGIFY_(x)
-#include STRINGIFY(MATPLOTLIBCPP_PYTHON_HEADER)
-#else // This should stay the default for backwards compatibility
-#include <python2.7/Python.h>
-#endif
+#include <Python.h>
+
+#ifndef WITHOUT_NUMPY
+  #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+  #include <numpy/arrayobject.h>
+#endif // WITHOUT_NUMPY
 
 #if PY_MAJOR_VERSION >= 3
 #define PyString_FromString PyUnicode_FromString
@@ -27,11 +27,19 @@
 namespace matplotlibcpp {
 
 	namespace detail {
+		static std::string s_backend;
+
 		struct _interpreter {
 			PyObject *s_python_function_show;
+			PyObject *s_python_function_draw;
+			PyObject *s_python_function_pause;
 			PyObject *s_python_function_save;
 			PyObject *s_python_function_figure;
 			PyObject *s_python_function_plot;
+			PyObject *s_python_function_semilogx;
+			PyObject *s_python_function_semilogy;
+			PyObject *s_python_function_loglog;
+			PyObject *s_python_function_fill_between;
 			PyObject *s_python_function_hist;
 			PyObject *s_python_function_subplot;
 			PyObject *s_python_function_legend;
@@ -44,8 +52,9 @@ namespace matplotlibcpp {
 			PyObject *s_python_function_grid;
 			PyObject *s_python_function_clf;
 			PyObject *s_python_function_errorbar;
-			PyObject *s_python_empty_tuple;
 			PyObject *s_python_function_annotate;
+			PyObject *s_python_function_tight_layout;
+			PyObject *s_python_empty_tuple;
 
 			/* For now, _interpreter is implemented as a singleton since its currently not possible to have
 			   multiple independent embedded python interpreters without patching the python source code
@@ -63,28 +72,52 @@ namespace matplotlibcpp {
                 
                 // optional but recommended
 #if PY_MAJOR_VERSION >= 3
-                wchar_t name[] = L"plotting";
+				wchar_t name[] = L"plotting";
 #else
-                char name[] = "plotting";
+				char name[] = "plotting";
 #endif
 				Py_SetProgramName(name);
 				Py_Initialize();
 
+#ifndef WITHOUT_NUMPY
+				import_array(); // initialize numpy C-API
+#endif
+
+				PyObject* matplotlibname = PyString_FromString("matplotlib");
 				PyObject* pyplotname = PyString_FromString("matplotlib.pyplot");
 				PyObject* pylabname  = PyString_FromString("pylab");
-				if(!pyplotname || !pylabname) { throw std::runtime_error("couldnt create string"); }
+				if (!pyplotname || !pylabname || !matplotlibname) {
+					throw std::runtime_error("couldnt create string");
+				}
+
+				PyObject* matplotlib = PyImport_Import(matplotlibname);
+				Py_DECREF(matplotlibname);
+				if(!matplotlib) { throw std::runtime_error("Error loading module matplotlib!"); }
+
+				// matplotlib.use() must be called *before* pylab, matplotlib.pyplot,
+				// or matplotlib.backends is imported for the first time
+				if (!s_backend.empty()) {
+					PyObject_CallMethod(matplotlib, const_cast<char*>("use"), const_cast<char*>("s"), s_backend.c_str());
+				}
 
 				PyObject* pymod = PyImport_Import(pyplotname);
 				Py_DECREF(pyplotname);
 				if(!pymod) { throw std::runtime_error("Error loading module matplotlib.pyplot!"); }
+
 
 				PyObject* pylabmod = PyImport_Import(pylabname);
 				Py_DECREF(pylabname);
 				if(!pylabmod) { throw std::runtime_error("Error loading module pylab!"); }
 
 				s_python_function_show = PyObject_GetAttrString(pymod, "show");
+				s_python_function_draw = PyObject_GetAttrString(pymod, "draw");
+				s_python_function_pause = PyObject_GetAttrString(pymod, "pause");
 				s_python_function_figure = PyObject_GetAttrString(pymod, "figure");
 				s_python_function_plot = PyObject_GetAttrString(pymod, "plot");
+				s_python_function_semilogx = PyObject_GetAttrString(pymod, "semilogx");
+				s_python_function_semilogy = PyObject_GetAttrString(pymod, "semilogy");
+				s_python_function_loglog = PyObject_GetAttrString(pymod, "loglog");
+				s_python_function_fill_between = PyObject_GetAttrString(pymod, "fill_between");
 				s_python_function_hist = PyObject_GetAttrString(pymod,"hist");
 				s_python_function_subplot = PyObject_GetAttrString(pymod, "subplot");
 				s_python_function_legend = PyObject_GetAttrString(pymod, "legend");
@@ -99,10 +132,17 @@ namespace matplotlibcpp {
 				s_python_function_annotate = PyObject_GetAttrString(pymod,"annotate");
 				s_python_function_clf = PyObject_GetAttrString(pymod, "clf");
 				s_python_function_errorbar = PyObject_GetAttrString(pymod, "errorbar");
+				s_python_function_tight_layout = PyObject_GetAttrString(pymod, "tight_layout");
 
 				if(        !s_python_function_show
+					|| !s_python_function_draw
+					|| !s_python_function_pause
 					|| !s_python_function_figure
 					|| !s_python_function_plot
+					|| !s_python_function_semilogx
+					|| !s_python_function_semilogy
+					|| !s_python_function_loglog
+					|| !s_python_function_fill_between
 					|| !s_python_function_subplot
 				   	|| !s_python_function_legend
 					|| !s_python_function_ylim
@@ -116,11 +156,19 @@ namespace matplotlibcpp {
 					|| !s_python_function_clf
 					|| !s_python_function_annotate
 					|| !s_python_function_errorbar
+					|| !s_python_function_errorbar
+					|| !s_python_function_tight_layout
 				) { throw std::runtime_error("Couldn't find required function!"); }
 
 				if (       !PyFunction_Check(s_python_function_show)
+					|| !PyFunction_Check(s_python_function_draw)
+					|| !PyFunction_Check(s_python_function_pause)
 					|| !PyFunction_Check(s_python_function_figure)
 					|| !PyFunction_Check(s_python_function_plot)
+					|| !PyFunction_Check(s_python_function_semilogx)
+					|| !PyFunction_Check(s_python_function_semilogy)
+					|| !PyFunction_Check(s_python_function_loglog)
+					|| !PyFunction_Check(s_python_function_fill_between)
 					|| !PyFunction_Check(s_python_function_subplot)
 					|| !PyFunction_Check(s_python_function_legend)
 					|| !PyFunction_Check(s_python_function_annotate)
@@ -133,6 +181,7 @@ namespace matplotlibcpp {
 					|| !PyFunction_Check(s_python_function_xlim)
 					|| !PyFunction_Check(s_python_function_save)
 					|| !PyFunction_Check(s_python_function_clf)
+					|| !PyFunction_Check(s_python_function_tight_layout)
 					|| !PyFunction_Check(s_python_function_errorbar)
 				) { throw std::runtime_error("Python object is unexpectedly not a PyFunction."); }
 
@@ -143,6 +192,12 @@ namespace matplotlibcpp {
 				Py_Finalize();
 			}
 		};
+	}
+
+	// must be called before the first regular call to matplotlib to have any effect
+	void backend(const std::string& name)
+	{
+		detail::s_backend = name;
 	}
   
 	bool annotate(std::string annotation, double x, double y)
@@ -169,24 +224,67 @@ namespace matplotlibcpp {
 		return res;
 	}
 
+#ifndef WITHOUT_NUMPY
+	// Type selector for numpy array conversion
+	template <typename T> struct select_npy_type { const static NPY_TYPES type = NPY_NOTYPE; }; //Default
+	template <> struct select_npy_type<double> { const static NPY_TYPES type = NPY_DOUBLE; };
+	template <> struct select_npy_type<float> { const static NPY_TYPES type = NPY_FLOAT; };
+	template <> struct select_npy_type<bool> { const static NPY_TYPES type = NPY_BOOL; };
+	template <> struct select_npy_type<int8_t> { const static NPY_TYPES type = NPY_INT8; };
+	template <> struct select_npy_type<int16_t> { const static NPY_TYPES type = NPY_SHORT; };
+	template <> struct select_npy_type<int32_t> { const static NPY_TYPES type = NPY_INT; };
+	template <> struct select_npy_type<int64_t> { const static NPY_TYPES type = NPY_INT64; };
+	template <> struct select_npy_type<uint8_t> { const static NPY_TYPES type = NPY_UINT8; };
+	template <> struct select_npy_type<uint16_t> { const static NPY_TYPES type = NPY_USHORT; };
+	template <> struct select_npy_type<uint32_t> { const static NPY_TYPES type = NPY_ULONG; };
+	template <> struct select_npy_type<uint64_t> { const static NPY_TYPES type = NPY_UINT64; };
+
+	template<typename Numeric>
+	PyObject* get_array(const std::vector<Numeric>& v)
+	{
+		detail::_interpreter::get();	//interpreter needs to be initialized for the numpy commands to work
+		NPY_TYPES type = select_npy_type<Numeric>::type; 
+		if (type == NPY_NOTYPE)
+		{
+			std::vector<double> vd(v.size());
+			npy_intp vsize = v.size();
+			std::copy(v.begin(),v.end(),vd.begin());
+			PyObject* varray = PyArray_SimpleNewFromData(1, &vsize, NPY_DOUBLE, (void*)(vd.data()));
+			return varray;
+		}
+
+		npy_intp vsize = v.size();
+		PyObject* varray = PyArray_SimpleNewFromData(1, &vsize, type, (void*)(v.data()));
+		return varray;
+	}
+
+#else // fallback if we don't have numpy: copy every element of the given vector
+
+	template<typename Numeric>
+	PyObject* get_array(const std::vector<Numeric>& v)
+	{
+		PyObject* list = PyList_New(v.size());
+		for(size_t i = 0; i < v.size(); ++i) {
+			PyList_SetItem(list, i, PyFloat_FromDouble(v.at(i)));
+		}
+		return list;
+	}
+
+#endif // WITHOUT_NUMPY
+
 	template<typename Numeric>
 	bool plot(const std::vector<Numeric> &x, const std::vector<Numeric> &y, const std::map<std::string, std::string>& keywords)
 	{
 		assert(x.size() == y.size());
 
-		// using python lists
-		PyObject* xlist = PyList_New(x.size());
-		PyObject* ylist = PyList_New(y.size());
-
-		for(size_t i = 0; i < x.size(); ++i) {
-			PyList_SetItem(xlist, i, PyFloat_FromDouble(x.at(i)));
-			PyList_SetItem(ylist, i, PyFloat_FromDouble(y.at(i)));
-		}
+		// using numpy arrays
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
 
 		// construct positional args
 		PyObject* args = PyTuple_New(2);
-		PyTuple_SetItem(args, 0, xlist);
-		PyTuple_SetItem(args, 1, ylist);
+		PyTuple_SetItem(args, 0, xarray);
+		PyTuple_SetItem(args, 1, yarray);
 
 		// construct keyword args
 		PyObject* kwargs = PyDict_New();
@@ -204,23 +302,54 @@ namespace matplotlibcpp {
 		return res;
 	}
 
+	template< typename Numeric >
+	bool fill_between(const std::vector<Numeric>& x, const std::vector<Numeric>& y1, const std::vector<Numeric>& y2, const std::map<std::string, std::string>& keywords)
+	{
+		assert(x.size() == y1.size());
+		assert(x.size() == y2.size());
+
+		// using numpy arrays
+		PyObject* xarray = get_array(x);
+		PyObject* y1array = get_array(y1);
+		PyObject* y2array = get_array(y2);
+
+		// construct positional args
+		PyObject* args = PyTuple_New(3);
+		PyTuple_SetItem(args, 0, xarray);
+		PyTuple_SetItem(args, 1, y1array);
+		PyTuple_SetItem(args, 2, y2array);
+
+		// construct keyword args
+		PyObject* kwargs = PyDict_New();
+		for(std::map<std::string, std::string>::const_iterator it = keywords.begin(); it != keywords.end(); ++it)
+		{
+			PyDict_SetItemString(kwargs, it->first.c_str(), PyUnicode_FromString(it->second.c_str()));
+		}
+
+		PyObject* res = PyObject_Call(detail::_interpreter::get().s_python_function_fill_between, args, kwargs);
+
+		Py_DECREF(args);
+		Py_DECREF(kwargs);
+		if(res) Py_DECREF(res);
+
+		return res;
+	}
+
 	template< typename Numeric>
 	bool hist(const std::vector<Numeric>& y, long bins=10,std::string color="b", double alpha=1.0)
 	{
-		PyObject* ylist = PyList_New(y.size());
-		
+
+		PyObject* yarray = get_array(y);
+
 		PyObject* kwargs = PyDict_New();
 		PyDict_SetItemString(kwargs, "bins", PyLong_FromLong(bins));
 		PyDict_SetItemString(kwargs, "color", PyString_FromString(color.c_str()));
 		PyDict_SetItemString(kwargs, "alpha", PyFloat_FromDouble(alpha));
 		
-		for(size_t i = 0; i < y.size(); ++i) {
-			PyList_SetItem(ylist, i, PyFloat_FromDouble(y.at(i)));
-		}
 
 		PyObject* plot_args = PyTuple_New(1);
 
-		PyTuple_SetItem(plot_args, 0, ylist);
+		PyTuple_SetItem(plot_args, 0, yarray);
 
 
 		PyObject* res = PyObject_Call(detail::_interpreter::get().s_python_function_hist, plot_args, kwargs);
@@ -236,19 +365,17 @@ namespace matplotlibcpp {
 	template< typename Numeric>
 	bool named_hist(std::string label,const std::vector<Numeric>& y, long bins=10, std::string color="b", double alpha=1.0)
 	{
-		PyObject* ylist = PyList_New(y.size());
+		PyObject* yarray = get_array(y);
+
 		PyObject* kwargs = PyDict_New();
 		PyDict_SetItemString(kwargs, "label", PyString_FromString(label.c_str()));
 		PyDict_SetItemString(kwargs, "bins", PyLong_FromLong(bins));
-		PyDict_SetItemString(kwargs, "color", PyString_FromString(color.c_str()));  
+		PyDict_SetItemString(kwargs, "color", PyString_FromString(color.c_str()));
 		PyDict_SetItemString(kwargs, "alpha", PyFloat_FromDouble(alpha));
-		
-		for(size_t i = 0; i < y.size(); ++i) {
-			PyList_SetItem(ylist, i, PyFloat_FromDouble(y.at(i)));
-		}
+
 
 		PyObject* plot_args = PyTuple_New(1);
-		PyTuple_SetItem(plot_args, 0, ylist);
+		PyTuple_SetItem(plot_args, 0, yarray);
 
 		PyObject* res = PyObject_Call(detail::_interpreter::get().s_python_function_hist, plot_args, kwargs);
 
@@ -264,21 +391,86 @@ namespace matplotlibcpp {
 	{
 		assert(x.size() == y.size());
 
-		PyObject* xlist = PyList_New(x.size());
-		PyObject* ylist = PyList_New(y.size());
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
+
 		PyObject* pystring = PyString_FromString(s.c_str());
 
-		for(size_t i = 0; i < x.size(); ++i) {
-			PyList_SetItem(xlist, i, PyFloat_FromDouble(x.at(i)));
-			PyList_SetItem(ylist, i, PyFloat_FromDouble(y.at(i)));
-		}
-
 		PyObject* plot_args = PyTuple_New(3);
-		PyTuple_SetItem(plot_args, 0, xlist);
-		PyTuple_SetItem(plot_args, 1, ylist);
+		PyTuple_SetItem(plot_args, 0, xarray);
+		PyTuple_SetItem(plot_args, 1, yarray);
 		PyTuple_SetItem(plot_args, 2, pystring);
 
 		PyObject* res = PyObject_CallObject(detail::_interpreter::get().s_python_function_plot, plot_args);
+
+		Py_DECREF(plot_args);
+		if(res) Py_DECREF(res);
+
+		return res;
+	}
+
+	template<typename NumericX, typename NumericY>
+	bool semilogx(const std::vector<NumericX>& x, const std::vector<NumericY>& y, const std::string& s = "")
+	{
+		assert(x.size() == y.size());
+
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
+
+		PyObject* pystring = PyString_FromString(s.c_str());
+
+		PyObject* plot_args = PyTuple_New(3);
+		PyTuple_SetItem(plot_args, 0, xarray);
+		PyTuple_SetItem(plot_args, 1, yarray);
+		PyTuple_SetItem(plot_args, 2, pystring);
+
+		PyObject* res = PyObject_CallObject(detail::_interpreter::get().s_python_function_semilogx, plot_args);
+
+		Py_DECREF(plot_args);
+		if(res) Py_DECREF(res);
+
+		return res;
+	}
+
+	template<typename NumericX, typename NumericY>
+	bool semilogy(const std::vector<NumericX>& x, const std::vector<NumericY>& y, const std::string& s = "")
+	{
+		assert(x.size() == y.size());
+
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
+
+		PyObject* pystring = PyString_FromString(s.c_str());
+
+		PyObject* plot_args = PyTuple_New(3);
+		PyTuple_SetItem(plot_args, 0, xarray);
+		PyTuple_SetItem(plot_args, 1, yarray);
+		PyTuple_SetItem(plot_args, 2, pystring);
+
+		PyObject* res = PyObject_CallObject(detail::_interpreter::get().s_python_function_semilogy, plot_args);
+
+		Py_DECREF(plot_args);
+		if(res) Py_DECREF(res);
+
+		return res;
+	}
+
+	template<typename NumericX, typename NumericY>
+	bool loglog(const std::vector<NumericX>& x, const std::vector<NumericY>& y, const std::string& s = "")
+	{
+		assert(x.size() == y.size());
+
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
+
+		PyObject* pystring = PyString_FromString(s.c_str());
+
+		PyObject* plot_args = PyTuple_New(3);
+		PyTuple_SetItem(plot_args, 0, xarray);
+		PyTuple_SetItem(plot_args, 1, yarray);
+		PyTuple_SetItem(plot_args, 2, pystring);
+
+		PyObject* res = PyObject_CallObject(detail::_interpreter::get().s_python_function_loglog, plot_args);
 
 		Py_DECREF(plot_args);
 		if(res) Py_DECREF(res);
@@ -291,26 +483,19 @@ namespace matplotlibcpp {
 	{
 		assert(x.size() == y.size());
 
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
+		PyObject* yerrarray = get_array(yerr);
+
 		PyObject *kwargs = PyDict_New();
-		PyObject *xlist = PyList_New(x.size());
-		PyObject *ylist = PyList_New(y.size());
-		PyObject *yerrlist = PyList_New(yerr.size());
 
-		for (size_t i = 0; i < yerr.size(); ++i)
-			PyList_SetItem(yerrlist, i, PyFloat_FromDouble(yerr.at(i)));
-
-		PyDict_SetItemString(kwargs, "yerr", yerrlist);
+		PyDict_SetItemString(kwargs, "yerr", yerrarray);
 
 		PyObject *pystring = PyString_FromString(s.c_str());
 
-		for (size_t i = 0; i < x.size(); ++i) {
-			PyList_SetItem(xlist, i, PyFloat_FromDouble(x.at(i)));
-			PyList_SetItem(ylist, i, PyFloat_FromDouble(y.at(i)));
-		}
-
 		PyObject *plot_args = PyTuple_New(2);
-		PyTuple_SetItem(plot_args, 0, xlist);
-		PyTuple_SetItem(plot_args, 1, ylist);
+		PyTuple_SetItem(plot_args, 0, xarray);
+		PyTuple_SetItem(plot_args, 1, yarray);
 
 		PyObject *res = PyObject_Call(detail::_interpreter::get().s_python_function_errorbar, plot_args, kwargs);
 
@@ -331,16 +516,13 @@ namespace matplotlibcpp {
 		PyObject* kwargs = PyDict_New();
 		PyDict_SetItemString(kwargs, "label", PyString_FromString(name.c_str()));
 
-		PyObject* ylist = PyList_New(y.size());
-		PyObject* pystring = PyString_FromString(format.c_str());
+		PyObject* yarray = get_array(y);
 
-		for(size_t i = 0; i < y.size(); ++i) {
-			PyList_SetItem(ylist, i, PyFloat_FromDouble(y.at(i)));
-		}
+		PyObject* pystring = PyString_FromString(format.c_str());
 
 		PyObject* plot_args = PyTuple_New(2);
 
-		PyTuple_SetItem(plot_args, 0, ylist);
+		PyTuple_SetItem(plot_args, 0, yarray);
 		PyTuple_SetItem(plot_args, 1, pystring);
 
 		PyObject* res = PyObject_Call(detail::_interpreter::get().s_python_function_plot, plot_args, kwargs);
@@ -358,21 +540,92 @@ namespace matplotlibcpp {
 		PyObject* kwargs = PyDict_New();
 		PyDict_SetItemString(kwargs, "label", PyString_FromString(name.c_str()));
 
-		PyObject* xlist = PyList_New(x.size());
-		PyObject* ylist = PyList_New(y.size());
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
+
 		PyObject* pystring = PyString_FromString(format.c_str());
 
-		for(size_t i = 0; i < x.size(); ++i) {
-			PyList_SetItem(xlist, i, PyFloat_FromDouble(x.at(i)));
-			PyList_SetItem(ylist, i, PyFloat_FromDouble(y.at(i)));
-		}
-
 		PyObject* plot_args = PyTuple_New(3);
-		PyTuple_SetItem(plot_args, 0, xlist);
-		PyTuple_SetItem(plot_args, 1, ylist);
+		PyTuple_SetItem(plot_args, 0, xarray);
+		PyTuple_SetItem(plot_args, 1, yarray);
 		PyTuple_SetItem(plot_args, 2, pystring);
 
 		PyObject* res = PyObject_Call(detail::_interpreter::get().s_python_function_plot, plot_args, kwargs);
+
+		Py_DECREF(kwargs);
+		Py_DECREF(plot_args);
+		if(res) Py_DECREF(res);
+
+		return res;
+	}
+
+	template<typename Numeric>
+	bool named_semilogx(const std::string& name, const std::vector<Numeric>& x, const std::vector<Numeric>& y, const std::string& format = "")
+	{
+		PyObject* kwargs = PyDict_New();
+		PyDict_SetItemString(kwargs, "label", PyString_FromString(name.c_str()));
+
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
+
+		PyObject* pystring = PyString_FromString(format.c_str());
+
+		PyObject* plot_args = PyTuple_New(3);
+		PyTuple_SetItem(plot_args, 0, xarray);
+		PyTuple_SetItem(plot_args, 1, yarray);
+		PyTuple_SetItem(plot_args, 2, pystring);
+
+		PyObject* res = PyObject_Call(detail::_interpreter::get().s_python_function_semilogx, plot_args, kwargs);
+
+		Py_DECREF(kwargs);
+		Py_DECREF(plot_args);
+		if(res) Py_DECREF(res);
+
+		return res;
+	}
+
+	template<typename Numeric>
+	bool named_semilogy(const std::string& name, const std::vector<Numeric>& x, const std::vector<Numeric>& y, const std::string& format = "")
+	{
+		PyObject* kwargs = PyDict_New();
+		PyDict_SetItemString(kwargs, "label", PyString_FromString(name.c_str()));
+
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
+
+		PyObject* pystring = PyString_FromString(format.c_str());
+
+		PyObject* plot_args = PyTuple_New(3);
+		PyTuple_SetItem(plot_args, 0, xarray);
+		PyTuple_SetItem(plot_args, 1, yarray);
+		PyTuple_SetItem(plot_args, 2, pystring);
+
+		PyObject* res = PyObject_Call(detail::_interpreter::get().s_python_function_semilogy, plot_args, kwargs);
+
+		Py_DECREF(kwargs);
+		Py_DECREF(plot_args);
+		if(res) Py_DECREF(res);
+
+		return res;
+	}
+
+	template<typename Numeric>
+	bool named_loglog(const std::string& name, const std::vector<Numeric>& x, const std::vector<Numeric>& y, const std::string& format = "")
+	{
+		PyObject* kwargs = PyDict_New();
+		PyDict_SetItemString(kwargs, "label", PyString_FromString(name.c_str()));
+
+		PyObject* xarray = get_array(x);
+		PyObject* yarray = get_array(y);
+
+		PyObject* pystring = PyString_FromString(format.c_str());
+
+		PyObject* plot_args = PyTuple_New(3);
+		PyTuple_SetItem(plot_args, 0, xarray);
+		PyTuple_SetItem(plot_args, 1, yarray);
+		PyTuple_SetItem(plot_args, 2, pystring);
+
+		PyObject* res = PyObject_Call(detail::_interpreter::get().s_python_function_loglog, plot_args, kwargs);
 
 		Py_DECREF(kwargs);
 		Py_DECREF(plot_args);
@@ -551,14 +804,49 @@ namespace matplotlibcpp {
 		// if PyDeCRFF, the function doesn't work on Mac OS
 	}
 
-	inline void show()
+    inline void show(const bool block = true)
+    {
+        PyObject* res;
+        if(block)
+        {
+            res = PyObject_CallObject(
+                    detail::_interpreter::get().s_python_function_show,
+                    detail::_interpreter::get().s_python_empty_tuple);
+        }
+        else
+        {
+            PyObject *kwargs = PyDict_New();
+            PyDict_SetItemString(kwargs, "block", Py_False);
+            res = PyObject_Call( detail::_interpreter::get().s_python_function_show, detail::_interpreter::get().s_python_empty_tuple, kwargs);
+        }
+
+
+        if (!res) throw std::runtime_error("Call to show() failed.");
+
+        Py_DECREF(res);
+    }
+
+	inline void draw()
 	{
 		PyObject* res = PyObject_CallObject(
-			detail::_interpreter::get().s_python_function_show,
+			detail::_interpreter::get().s_python_function_draw,
 			detail::_interpreter::get().s_python_empty_tuple);
 
-		if (!res) throw std::runtime_error("Call to show() failed.");
+		if (!res) throw std::runtime_error("Call to draw() failed.");
 
+		Py_DECREF(res);
+	}
+
+	template<typename Numeric>
+	void pause(Numeric interval)
+	{
+		PyObject* args = PyTuple_New(1);
+		PyTuple_SetItem(args, 0, PyFloat_FromDouble(interval));
+
+		PyObject* res = PyObject_CallObject(detail::_interpreter::get().s_python_function_pause, args);
+		if(!res) throw std::runtime_error("Call to pause() failed.");
+
+		Py_DECREF(args);
 		Py_DECREF(res);
 	}
 
@@ -582,6 +870,17 @@ namespace matplotlibcpp {
 			detail::_interpreter::get().s_python_empty_tuple);
 
 		if (!res) throw std::runtime_error("Call to clf() failed.");
+
+		Py_DECREF(res);
+	}
+
+	// Actually, is there any reason not to call this automatically for every plot?
+	inline void tight_layout() {
+		PyObject *res = PyObject_CallObject(
+			detail::_interpreter::get().s_python_function_tight_layout,
+			detail::_interpreter::get().s_python_empty_tuple);
+
+		if (!res) throw std::runtime_error("Call to tight_layout() failed.");
 
 		Py_DECREF(res);
 	}

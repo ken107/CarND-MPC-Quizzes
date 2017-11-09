@@ -61,7 +61,7 @@ class FG_eval {
     // The part of the cost based on the reference state.
     for (int t = 0; t < N; t++) {
       fg[0] += CppAD::pow(vars[cte_start + t], 2);
-      fg[0] += CppAD::pow(vars[epsi_start + t], 2);
+      fg[0] += 10* CppAD::pow(vars[epsi_start + t], 2);
       fg[0] += CppAD::pow(vars[v_start + t] - ref_v, 2);
     }
 
@@ -73,7 +73,7 @@ class FG_eval {
 
     // Minimize the value gap between sequential actuations.
     for (int t = 0; t < N - 2; t++) {
-      fg[0] += CppAD::pow(vars[delta_start + t + 1] - vars[delta_start + t], 2);
+      fg[0] += 5* CppAD::pow(vars[delta_start + t + 1] - vars[delta_start + t], 2);
       fg[0] += CppAD::pow(vars[a_start + t + 1] - vars[a_start + t], 2);
     }
 
@@ -116,8 +116,8 @@ class FG_eval {
       AD<double> delta0 = vars[delta_start + t - 1];
       AD<double> a0 = vars[a_start + t - 1];
 
-      AD<double> f0 = coeffs[0] + coeffs[1] * x0;
-      AD<double> psides0 = CppAD::atan(coeffs[1]);
+      AD<double> f0 = coeffs[0] + coeffs[1]*x0 + coeffs[2]*x0*x0 + coeffs[3]*x0*x0*x0;
+      AD<double> psides0 = CppAD::atan(coeffs[1] + 2*coeffs[2]*x0 + 3*coeffs[3]*x0*x0);
 
       // Here's `x` to get you started.
       // The idea here is to constraint this value to be 0.
@@ -300,14 +300,27 @@ int main() {
   MPC mpc;
   int iters = 50;
 
-  Eigen::VectorXd ptsx(2);
-  Eigen::VectorXd ptsy(2);
-  ptsx << -100, 100;
-  ptsy << -1, -1;
+  int waypoints = 4;
+  Eigen::VectorXd ptsx(waypoints);
+  Eigen::VectorXd ptsy(waypoints);
+  ptsx << -1, 2, 5, 8;
+  ptsy << -1, -2, -1, 3;
+
+  vector<double> wp_x, wp_y;
+  for (int i=0; i<waypoints; i++) {
+    wp_x.push_back(ptsx[i]);
+    wp_y.push_back(ptsy[i]);
+  }
 
   // The polynomial is fitted to a straight line so a polynomial with
   // order 1 is sufficient.
-  auto coeffs = polyfit(ptsx, ptsy, 1);
+  auto coeffs = polyfit(ptsx, ptsy, 3);
+
+  vector<double> ref_x, ref_y;
+  for (int i=-5; i<20; i++) {
+    ref_x.push_back(i);
+    ref_y.push_back(polyeval(coeffs, i));
+  }
 
   // NOTE: free feel to play around with these
   double x = -1;
@@ -319,7 +332,7 @@ int main() {
   double cte = polyeval(coeffs, x) - y;
   // Due to the sign starting at 0, the orientation error is -f'(x).
   // derivative of coeffs[0] + coeffs[1] * x -> coeffs[1]
-  double epsi = psi - atan(coeffs[1]);
+  double epsi = psi - atan(coeffs[1] + 2*coeffs[2]*x + 3*coeffs[3]*x*x);
 
   Eigen::VectorXd state(6);
   state << x, y, psi, v, cte, epsi;
@@ -363,15 +376,37 @@ int main() {
   // Plot values
   // NOTE: feel free to play around with this.
   // It's useful for debugging!
-  plt::subplot(3, 1, 1);
-  plt::title("CTE");
-  plt::plot(cte_vals);
-  plt::subplot(3, 1, 2);
-  plt::title("Delta (Radians)");
-  plt::plot(delta_vals);
-  plt::subplot(3, 1, 3);
-  plt::title("Velocity");
+  for (int i=0; i<psi_vals.size(); i++) {
+    psi_vals[i] *= 180 / M_PI;
+    delta_vals[i] *= 180 / M_PI;
+    epsi_vals[i] *= 180 / M_PI;
+  }
+
+  plt::subplot(3, 3, 2);
+  plt::title("XY");
+  plt::plot(wp_x, wp_y);
+  plt::plot(ref_x, ref_y);
+  plt::plot(x_vals, y_vals);
+  plt::subplot(3, 3, 3);
+  plt::title("Psi");
+  plt::plot(psi_vals);
+  plt::subplot(3, 3, 4);
+  plt::title("V");
   plt::plot(v_vals);
 
+  plt::subplot(3, 3, 5);
+  plt::title("Delta");
+  plt::plot(delta_vals);
+  plt::subplot(3, 3, 6);
+  plt::title("A");
+  plt::plot(a_vals);
+  plt::subplot(3, 3, 7);
+  plt::title("CTE");
+  plt::plot(cte_vals);
+  plt::subplot(3, 3, 8);
+  plt::title("Epsi");
+  plt::plot(epsi_vals);
+
+  plt::tight_layout();
   plt::show();
 }

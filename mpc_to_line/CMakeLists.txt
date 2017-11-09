@@ -13,6 +13,7 @@ set(sources src/MPC.cpp)
 
 include_directories(src/Eigen-3.3)
 include_directories(/usr/local/include)
+include_directories(/usr/include/python2.7)
 link_directories(/usr/local/lib)
 
 add_executable(mpc ${sources})
